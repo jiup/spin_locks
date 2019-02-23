@@ -6,6 +6,7 @@
 #include <mutex>
 #include <chrono>
 #include <stdatomic.h>
+#include <unistd.h>
 
 class lock;
 
@@ -80,16 +81,28 @@ public:
 
 // TAS lock with well-tuned exponential backoff
 // you’ll need to experiment with different base, multiplier, and cap values
-// todo
 class eback_tas_lock : public lock {
+private:
+    std::atomic_flag f = ATOMIC_FLAG_INIT;
+    const int base, limit, multiplier;
+
 public:
-    eback_tas_lock() = default;
+    explicit eback_tas_lock(int base = 1, int limit = 256, int multiplier = 2) : base(base), limit(limit),
+                                                                                 multiplier(multiplier) {}
 
-    eback_tas_lock(eback_tas_lock const &other) {}
+    eback_tas_lock(eback_tas_lock const &other) : base(other.base), limit(other.limit), multiplier(other.multiplier) {}
 
-    void acquire() override {}
+    void acquire() override {
+        int delay = base;
+        while (f.test_and_set()) {
+            usleep(static_cast<useconds_t>(delay));
+            delay = std::min(delay * multiplier, limit);
+        }
+    }
 
-    void release() override {}
+    void release() override {
+        f.clear();
+    }
 };
 
 // naive ticket lock
