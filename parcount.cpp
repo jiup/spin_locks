@@ -106,29 +106,57 @@ public:
 };
 
 // naive ticket lock
-// todo
 class ticket_lock : public lock {
+private:
+    std::atomic_int next_ticket{};
+    std::atomic_int now_serving{};
+
 public:
     ticket_lock() = default;
 
     ticket_lock(ticket_lock const &other) {}
 
-    void acquire() override {}
+    void acquire() override {
+        int my_ticket = next_ticket.fetch_add(1);
+        while (now_serving.load() != my_ticket);
+    }
 
-    void release() override {}
+    void release() override {
+        int t = now_serving.load() + 1;
+        now_serving.store(t);
+    }
 };
 
 // ticket lock with well-tuned proportional backoff
-// todo
+// tuning parameter base should be chosen to be roughly the length of a trivial critical section
 class pback_ticket_lock : public lock {
+private:
+    std::atomic_int next_ticket{};
+    std::atomic_int now_serving{};
+    const int base;
+
 public:
-    pback_ticket_lock() = default;
+    explicit pback_ticket_lock(int base = 0) : base(base) {}
 
-    pback_ticket_lock(pback_ticket_lock const &other) {}
+    pback_ticket_lock(pback_ticket_lock const &other) : base(other.base) {}
 
-    void acquire() override {}
+    void acquire() override {
+        int my_ticket = next_ticket.fetch_add(1), ns;
+        while (true) {
+            ns = now_serving.load();
+            if (ns == my_ticket) {
+                break;
+            }
+            if (base > 0) { // switch off the pause if base is zero
+                usleep(static_cast<useconds_t>(base * (my_ticket - ns)));
+            }
+        }
+    }
 
-    void release() override {}
+    void release() override {
+        int t = now_serving.load() + 1;
+        now_serving.store(t);
+    }
 };
 
 // MCS lock
@@ -253,7 +281,9 @@ void run_tests(int t_cnt, int iter_cnt, const int cores, const int step) {
     test(ticket, t_cnt, iter_cnt, cores, step);
 
     std::cout << "\nrunning test_pback_ticket..." << std::endl;
-    auto pback_ticket = pback_ticket_lock();
+    // since the critical section is too small, set a base will obviously
+    // slow down the efficiency, which was caused by the usleep overhead.
+    auto pback_ticket = pback_ticket_lock(1);
     test(pback_ticket, t_cnt, iter_cnt, cores, step);
 
     std::cout << "\nrunning test_mcs..." << std::endl;
