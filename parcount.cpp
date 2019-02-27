@@ -74,6 +74,8 @@ public:
 
     void acquire() override {
         while (f.test_and_set());
+        atomic_thread_fence(std::memory_order_acquire);
+        atomic_signal_fence(std::memory_order_acquire);
     }
 
     void release() override {
@@ -100,6 +102,8 @@ public:
             for (int i = 0; i < delay; i++);
             delay = std::min(delay * multiplier, limit);
         }
+        atomic_thread_fence(std::memory_order_acquire);
+        atomic_signal_fence(std::memory_order_acquire);
     }
 
     void release() override {
@@ -121,11 +125,13 @@ public:
     void acquire() override {
         int my_ticket = next_ticket.fetch_add(1);
         while (now_serving.load() != my_ticket);
+        atomic_thread_fence(std::memory_order_acquire);
+        atomic_signal_fence(std::memory_order_acquire);
     }
 
     void release() override {
         int t = now_serving.load() + 1;
-        now_serving.store(t);
+        now_serving.store(t, std::memory_order_release);
     }
 };
 
@@ -146,11 +152,13 @@ public:
             }
             for (int i = 0, pause = base * (my_ticket - ns); i < pause; i++);
         }
+        atomic_thread_fence(std::memory_order_acquire);
+        atomic_signal_fence(std::memory_order_acquire);
     }
 
     void release() override {
         int t = now_serving.load() + 1;
-        now_serving.store(t);
+        now_serving.store(t, std::memory_order_release);
     }
 
 private:
@@ -175,10 +183,10 @@ public:
 
     void acquire(qnode &p) {
         p.next.store(nullptr);
-        p.waiting.store(true);
-        qnode* prev = tail.exchange(&p);    // W||
+        p.waiting.store(true, std::memory_order_relaxed);
+        qnode* prev = tail.exchange(&p, std::memory_order_release); // W||
         if (prev != nullptr) {
-            prev->next.store(&p);
+            prev->next.store(&p, std::memory_order_relaxed);
             while (p.waiting.load());
         }
         atomic_thread_fence(std::memory_order_acquire);
@@ -186,13 +194,13 @@ public:
     }
 
     void release(qnode &p) {
-        qnode* succ = p.next.load();        // WR||
+        qnode* succ = p.next.load(std::memory_order_acquire); // WR||
         if (succ == nullptr) {
             qnode* t = &p;
             if (tail.compare_exchange_strong(t, nullptr)) {
                 return;
             }
-            while ((succ = p.next.load()) == nullptr);
+            while ((succ = p.next.load(std::memory_order_relaxed)) == nullptr);
         }
         succ->waiting.store(false);
     }
@@ -302,7 +310,7 @@ void run_tests(int t_cnt, int iter_cnt, const int cores, const int step) {
     test(tas, t_cnt, iter_cnt, cores, step);
 
     std::cout << "\nrunning test_eback_tas..." << std::endl;
-    auto eback_tas = eback_tas_lock();
+    auto eback_tas = eback_tas_lock(10240, 256, 2);
     test(eback_tas, t_cnt, iter_cnt, cores, step);
 
     std::cout << "\nrunning test_naive_ticket..." << std::endl;
@@ -312,7 +320,7 @@ void run_tests(int t_cnt, int iter_cnt, const int cores, const int step) {
     std::cout << "\nrunning test_pback_ticket..." << std::endl;
     // since the critical section is too small, set a base will obviously
     // slow down the efficiency, which was caused by the usleep overhead.
-    auto pback_ticket = pback_ticket_lock(1);
+    auto pback_ticket = pback_ticket_lock(30);
     test(pback_ticket, t_cnt, iter_cnt, cores, step);
 
     std::cout << "\nrunning test_mcs..." << std::endl;
