@@ -89,7 +89,7 @@ private:
     const int base, limit, multiplier;
 
 public:
-    explicit eback_tas_lock(int base = 1, int limit = 256, int multiplier = 2) : base(base), limit(limit),
+    explicit eback_tas_lock(int base = 10240, int limit = 256, int multiplier = 2) : base(base), limit(limit),
                                                                                  multiplier(multiplier) {}
 
     eback_tas_lock(eback_tas_lock const &other) : base(other.base), limit(other.limit), multiplier(other.multiplier) {}
@@ -97,7 +97,7 @@ public:
     void acquire() override {
         int delay = base;
         while (f.test_and_set()) {
-            usleep(static_cast<useconds_t>(delay));
+            for (int i = 0; i < delay; i++);
             delay = std::min(delay * multiplier, limit);
         }
     }
@@ -133,7 +133,7 @@ public:
 // tuning parameter base should be chosen to be roughly the length of a trivial critical section
 class pback_ticket_lock : public lock {
 public:
-    explicit pback_ticket_lock(int base = 0) : base(base) {}
+    explicit pback_ticket_lock(int base = 20) : base(base) {}
 
     pback_ticket_lock(pback_ticket_lock const &other) : base(other.base) {}
 
@@ -144,9 +144,7 @@ public:
             if (ns == my_ticket) {
                 break;
             }
-            if (base > 0) { // switch off the pause if base is zero
-                usleep(static_cast<useconds_t>(base * (my_ticket - ns)));
-            }
+            for (int i = 0, pause = base * (my_ticket - ns); i < pause; i++);
         }
     }
 
@@ -162,45 +160,41 @@ private:
 };
 
 // MCS lock
-// fixme
 class mcs_lock {
 public:
     struct qnode {
-        std::atomic<qnode*> next{};
-        std::atomic<bool> waiting{};
+        qnode() = default;
+        qnode(qnode const &other) {};
+        std::atomic<qnode*> next{nullptr};
+        std::atomic<bool> waiting{true};
     };
 
     mcs_lock() = default;
 
     mcs_lock(mcs_lock const &other) {};
 
-    void acquire(qnode* p) {
-        p->next.store(nullptr);
-        p->waiting.store(true);
-        qnode* prev = tail.exchange(p, std::memory_order_release);
+    void acquire(qnode &p) {
+        p.next.store(nullptr);
+        p.waiting.store(true);
+        qnode* prev = tail.exchange(&p);    // W||
         if (prev != nullptr) {
-            prev->next.store(p);
-            while (p->waiting.load()) {
-//                std::cout<<"acq"<<std::endl;
-            }
+            prev->next.store(&p);
+            while (p.waiting.load());
         }
-//        std::cout<<"acq"<<std::endl;
-        atomic_thread_fence(std::memory_order_acq_rel);
-//        atomic_signal_fence(std::memory_order_consume);
+        atomic_thread_fence(std::memory_order_acquire);
+        atomic_signal_fence(std::memory_order_acquire);
     }
 
-    void release(qnode* p) {
-        qnode* successor = p->next.load(std::memory_order_acq_rel);
-        if (successor == nullptr) {
-            if (tail.compare_exchange_strong(p, nullptr)) {
+    void release(qnode &p) {
+        qnode* succ = p.next.load();        // WR||
+        if (succ == nullptr) {
+            qnode* t = &p;
+            if (tail.compare_exchange_strong(t, nullptr)) {
                 return;
             }
-            while ((successor = p->next.load()) == nullptr) {
-//                std::cout<<"rel"<<std::endl;
-            }
+            while ((succ = p.next.load()) == nullptr);
         }
-//        std::cout<<"rel"<<std::endl;
-        successor->waiting.store(false);
+        succ->waiting.store(false);
     }
 
 private:
@@ -375,7 +369,6 @@ void test(::lock &lock, const int t_cnt, const int iter_cnt, const int cores, co
     std::cout << "completed in " << diff.count() << " ms" << std::endl;
 }
 
-std::mutex mutex;
 void test_mcs(mcs_lock &lock, const int t_cnt, const int iter_cnt, const int cores, const int step) {
     struct t_state {
         mcs_lock *lock;
@@ -393,20 +386,12 @@ void test_mcs(mcs_lock &lock, const int t_cnt, const int iter_cnt, const int cor
             std::atomic_bool *trigger = state->start;
             int *cnt = state->counter, it_cnt = state->iter_cnt;
             while (!trigger->load());
-            auto *qnode = new mcs_lock::qnode;
-            auto t_id = pthread_self();
             for (int t = 0; t < it_cnt; t++) {
+                auto qnode = mcs_lock::qnode();
                 state->lock->acquire(qnode);
-                mutex.lock();
-                std::cout<<t_id<<" acq"<<std::endl;
-                mutex.unlock();
                 *cnt = *cnt + 1;
                 state->lock->release(qnode);
-                mutex.lock();
-                std::cout<<t_id<<" rel"<<std::endl;
-                mutex.unlock();
             }
-            delete qnode;
             return nullptr;
         }, &params);
         set_affinity(threads[i], i, cores, step);
