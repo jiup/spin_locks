@@ -225,7 +225,6 @@ public:
     };
 
     qnode* waiting = new qnode;
-    qnode* _null = nullptr;
     qnode q = qnode();
 
     ~k42_mcs_lock() {
@@ -236,6 +235,7 @@ public:
         while (true) {
             qnode* prev = q.tail.load();
             if (prev == nullptr) {
+                qnode* _null = nullptr;
                 if (q.tail.compare_exchange_strong(_null, &q)) {
                     break;
                 }
@@ -268,6 +268,7 @@ public:
         qnode* succ = q.next.load(); // RW||
         if (succ == nullptr) {
             auto* tmp = &q;
+            qnode* _null = nullptr;
             if (q.tail.compare_exchange_strong(tmp, _null)) {
                 return;
             }
