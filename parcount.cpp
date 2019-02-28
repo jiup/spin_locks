@@ -215,43 +215,46 @@ class k42_mcs_lock : public lock {
 public:
     struct qnode {
         qnode() = default;
+        qnode(qnode* tail, qnode* next) {
+            this->tail = tail;
+            this->next = next;
+        }
         qnode(qnode const &that) {};
         std::atomic<qnode*> tail{};
         std::atomic<qnode*> next{};
     };
 
     qnode* waiting = new qnode;
-    qnode* q = new qnode;
     qnode* _null = nullptr;
+    qnode q = qnode();
 
     ~k42_mcs_lock() {
         delete(waiting);
-        delete(q);
     }
 
     void acquire() override {
         while (true) {
-            qnode* prev = q->tail;
-            if (prev == _null) {
-                if (q->tail.compare_exchange_strong(_null, q)) {
+            qnode* prev = q.tail.load();
+            if (prev == nullptr) {
+                if (q.tail.compare_exchange_strong(_null, &q)) {
                     break;
                 }
             } else {
-                auto* n = new qnode();
-                n->tail.store(waiting);
-                if (q->tail.compare_exchange_strong(prev, n)) { // W||
-                    prev->next.store(n);
-                    while (n->tail.load() == waiting);
-                    qnode* succ = n->next.load();
-                    if (succ == _null) {
-                        q->next.store(_null);
-                        if (!(q->tail.compare_exchange_strong(n, q))) {
-                            while ((succ = n->next.load()) == _null);
-                            q->next.store(succ);
+                auto n = qnode(waiting, nullptr);
+                if (q.tail.compare_exchange_strong(prev, &n)) { // W||
+                    prev->next.store(&n);
+                    while (n.tail.load() == waiting);
+                    qnode* succ = n.next.load();
+                    if (succ == nullptr) {
+                        q.next.store(nullptr);
+                        auto tmp = &n;
+                        if (!(q.tail.compare_exchange_strong(tmp, &q))) {
+                            while ((succ = n.next.load()) == nullptr);
+                            q.next.store(succ);
                         }
                         break;
                     } else {
-                        q->next.store(succ);
+                        q.next.store(succ);
                         break;
                     }
                 }
@@ -262,14 +265,15 @@ public:
     }
 
     void release() override {
-        qnode* succ = q->next.load(); // RW||
+        qnode* succ = q.next.load(); // RW||
         if (succ == nullptr) {
-            if (q->tail.compare_exchange_strong(q, _null)) {
+            auto* tmp = &q;
+            if (q.tail.compare_exchange_strong(tmp, _null)) {
                 return;
             }
-            while ((succ = q->next.load()) == nullptr);
+            while ((succ = q.next.load()) == nullptr);
         }
-        succ->tail.store(_null);
+        succ->tail.store(nullptr);
     }
 };
 
@@ -369,8 +373,6 @@ void run_tests(int t_cnt, int iter_cnt, const int cores, const int step) {
     test(ticket, t_cnt, iter_cnt, cores, step);
 
     std::cout << "\nrunning test_pback_ticket..." << std::endl;
-    // since the critical section is too small, set a base will obviously
-    // slow down the efficiency, which was caused by the usleep overhead.
     auto pback_ticket = pback_ticket_lock(30);
     test(pback_ticket, t_cnt, iter_cnt, cores, step);
 
