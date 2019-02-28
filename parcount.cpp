@@ -51,7 +51,7 @@ private:
 public:
     cpp_mutex_lock() = default;
 
-    cpp_mutex_lock(cpp_mutex_lock const &other) {}
+    cpp_mutex_lock(cpp_mutex_lock const &that) {}
 
     void acquire() override {
         lock.lock();
@@ -70,7 +70,7 @@ private:
 public:
     tas_lock() = default;
 
-    tas_lock(tas_lock const &other) {}
+    tas_lock(tas_lock const &that) {}
 
     void acquire() override {
         while (f.test_and_set());
@@ -92,9 +92,9 @@ private:
 
 public:
     explicit eback_tas_lock(int base = 10240, int limit = 256, int multiplier = 2) : base(base), limit(limit),
-                                                                                 multiplier(multiplier) {}
+                                                                                     multiplier(multiplier) {}
 
-    eback_tas_lock(eback_tas_lock const &other) : base(other.base), limit(other.limit), multiplier(other.multiplier) {}
+    eback_tas_lock(eback_tas_lock const &that) : base(that.base), limit(that.limit), multiplier(that.multiplier) {}
 
     void acquire() override {
         int delay = base;
@@ -120,7 +120,7 @@ private:
 public:
     ticket_lock() = default;
 
-    ticket_lock(ticket_lock const &other) {}
+    ticket_lock(ticket_lock const &that) {}
 
     void acquire() override {
         int my_ticket = next_ticket.fetch_add(1);
@@ -141,7 +141,7 @@ class pback_ticket_lock : public lock {
 public:
     explicit pback_ticket_lock(int base = 20) : base(base) {}
 
-    pback_ticket_lock(pback_ticket_lock const &other) : base(other.base) {}
+    pback_ticket_lock(pback_ticket_lock const &that) : base(that.base) {}
 
     void acquire() override {
         int my_ticket = next_ticket.fetch_add(1), ns;
@@ -172,14 +172,14 @@ class mcs_lock {
 public:
     struct qnode {
         qnode() = default;
-        qnode(qnode const &other) {};
+        qnode(qnode const &that) {};
         std::atomic<qnode*> next{nullptr};
         std::atomic<bool> waiting{true};
     };
 
     mcs_lock() = default;
 
-    mcs_lock(mcs_lock const &other) {};
+    mcs_lock(mcs_lock const &that) {};
 
     void acquire(qnode &p) {
         p.next.store(nullptr);
@@ -210,16 +210,67 @@ private:
 };
 
 // "K42" MCS lock with standard interface
-// todo
+// fixme
 class k42_mcs_lock : public lock {
 public:
-    k42_mcs_lock() = default;
+    struct qnode {
+        qnode() = default;
+        qnode(qnode const &that) {};
+        std::atomic<qnode*> tail{};
+        std::atomic<qnode*> next{};
+    };
 
-    k42_mcs_lock(k42_mcs_lock const &other) {}
+    qnode* waiting = new qnode;
+    qnode* q = new qnode;
+    qnode* _null = nullptr;
 
-    void acquire() override {}
+    ~k42_mcs_lock() {
+        delete(waiting);
+        delete(q);
+    }
 
-    void release() override {}
+    void acquire() override {
+        while (true) {
+            qnode* prev = q->tail;
+            if (prev == _null) {
+                if (q->tail.compare_exchange_strong(_null, q)) {
+                    break;
+                }
+            } else {
+                auto* n = new qnode();
+                n->tail.store(waiting);
+                if (q->tail.compare_exchange_strong(prev, n)) { // W||
+                    prev->next.store(n);
+                    while (n->tail.load() == waiting);
+                    qnode* succ = n->next.load();
+                    if (succ == _null) {
+                        q->next.store(_null);
+                        if (!(q->tail.compare_exchange_strong(n, q))) {
+                            while ((succ = n->next.load()) == _null);
+                            q->next.store(succ);
+                        }
+                        break;
+                    } else {
+                        q->next.store(succ);
+                        break;
+                    }
+                }
+            }
+        }
+        atomic_thread_fence(std::memory_order_acquire);
+        atomic_signal_fence(std::memory_order_acquire);
+    }
+
+    void release() override {
+        qnode* succ = q->next.load(); // RW||
+        if (succ == nullptr) {
+            if (q->tail.compare_exchange_strong(q, _null)) {
+                return;
+            }
+            while ((succ = q->next.load()) == nullptr);
+        }
+        succ->tail.store(_null);
+    }
 };
 
 // CLH lock
@@ -228,7 +279,7 @@ class clh_lock : public lock {
 public:
     clh_lock() = default;
 
-    clh_lock(clh_lock const &other) {}
+    clh_lock(clh_lock const &that) {}
 
     void acquire() override {}
 
@@ -241,7 +292,7 @@ class k42_clh_lock : public lock {
 public:
     k42_clh_lock() = default;
 
-    k42_clh_lock(k42_clh_lock const &other) {}
+    k42_clh_lock(k42_clh_lock const &that) {}
 
     void acquire() override {}
 
