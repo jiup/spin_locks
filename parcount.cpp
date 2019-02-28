@@ -36,6 +36,8 @@ void test(lock &lock, int t_cnt, int iter_cnt, int cores, int step);
 
 void test_mcs(mcs_lock &lock, int t_cnt, int iter_cnt, int cores, int step);
 
+void test_clh(clh_lock &lock, int t_cnt, int iter_cnt, int cores, int step);
+
 class lock {
 public:
     virtual void acquire() = 0;
@@ -210,7 +212,6 @@ private:
 };
 
 // "K42" MCS lock with standard interface
-// fixme
 class k42_mcs_lock : public lock {
 public:
     struct qnode {
@@ -223,9 +224,6 @@ public:
         std::atomic<qnode*> tail{};
         std::atomic<qnode*> next{};
     };
-
-    qnode* waiting = new qnode;
-    qnode q = qnode();
 
     ~k42_mcs_lock() {
         delete(waiting);
@@ -276,19 +274,48 @@ public:
         }
         succ->tail.store(nullptr);
     }
+
+private:
+    qnode* waiting = new qnode;
+    qnode q = qnode();
 };
 
 // CLH lock
-// todo
-class clh_lock : public lock {
+class clh_lock {
 public:
-    clh_lock() = default;
+    struct qnode {
+        qnode() = default;
+        qnode(qnode* prev, bool succ_must_wait) {
+            this->prev = prev;
+            this->succ_must_wait = succ_must_wait;
+        }
+        qnode(qnode const &that) {};
+        std::atomic<qnode*> prev{nullptr};
+        std::atomic<bool> succ_must_wait{true};
+    };
+
+    qnode dummy = {nullptr, false};
+    std::atomic<qnode*> tail{};
+
+    clh_lock() {
+        this->tail.store(&dummy);
+    };
 
     clh_lock(clh_lock const &that) {}
 
-    void acquire() override {}
+    void acquire(qnode* p) {
+        p->succ_must_wait.store(true);
+        qnode* pred = p->prev = tail.exchange(p); // W||
+        while (pred->succ_must_wait.load());
+        atomic_thread_fence(std::memory_order_acquire);
+        atomic_signal_fence(std::memory_order_acquire);
+    }
 
-    void release() override {}
+    void release(qnode** pp) {
+        qnode* pred = (*pp)->prev;
+        (*pp)->succ_must_wait.store(false); // RW||
+        *pp = pred;
+    }
 };
 
 // “K42” CLH lock
@@ -387,7 +414,7 @@ void run_tests(int t_cnt, int iter_cnt, const int cores, const int step) {
 
     std::cout << "\nrunning test_clh..." << std::endl;
     auto clh = clh_lock();
-    test(clh, t_cnt, iter_cnt, cores, step);
+    test_clh(clh, t_cnt, iter_cnt, cores, step);
 
     std::cout << "\nrunning test_k42_clh..." << std::endl;
     auto k42_clh = k42_clh_lock();
@@ -453,6 +480,45 @@ void test_mcs(mcs_lock &lock, const int t_cnt, const int iter_cnt, const int cor
                 state->lock->acquire(qnode);
                 *cnt = *cnt + 1;
                 state->lock->release(qnode);
+            }
+            return nullptr;
+        }, &params);
+        set_affinity(threads[i], i, cores, step);
+    }
+    start = true;
+    auto start_t = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < t_cnt; i++) {
+        pthread_join(threads[i], nullptr);
+    }
+    auto end_t = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> diff = end_t - start_t;
+    std::cout << "result of count: " << counter << std::endl;
+    std::cout << "completed in " << diff.count() << " ms" << std::endl;
+}
+
+void test_clh(clh_lock &lock, const int t_cnt, const int iter_cnt, const int cores, const int step) {
+    struct t_state {
+        clh_lock *lock;
+        std::atomic_bool *start;
+        int *counter;
+        int iter_cnt;
+    };
+    pthread_t threads[t_cnt];
+    int counter = 0;
+    std::atomic_bool start;
+    t_state params = {&lock, &start, &counter, iter_cnt};
+    for (int i = 0; i < t_cnt; i++) {
+        pthread_create(&(threads[i]), nullptr, [](void *args) -> void * {
+            auto *state = static_cast<struct t_state *>(args);
+            std::atomic_bool *trigger = state->start;
+            int *cnt = state->counter, it_cnt = state->iter_cnt;
+            while (!trigger->load());
+            for (int t = 0; t < it_cnt; t++) {
+                auto* qnode = new clh_lock::qnode();
+                state->lock->acquire(qnode);
+                *cnt = *cnt + 1;
+                state->lock->release(&qnode);
+                // delete qnode ?? fixme
             }
             return nullptr;
         }, &params);
