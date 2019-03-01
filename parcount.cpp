@@ -42,6 +42,8 @@ void test_k42_clh(k42_clh_lock &lock, int t_cnt, int iter_cnt, int cores, int st
 
 pthread_key_t pthread_key;
 
+pthread_key_t pthread_id_key;
+
 class lock {
 public:
     virtual void acquire() = 0;
@@ -332,7 +334,7 @@ public:
             this->succ_must_wait = succ_must_wait;
         }
         qnode(qnode const &that) {};
-        std::atomic<bool> succ_must_wait{true};
+        std::atomic<bool> succ_must_wait{};
     };
 
     k42_clh_lock() {
@@ -342,17 +344,14 @@ public:
     k42_clh_lock(k42_clh_lock const &that) {}
 
     void acquire() override {
-        qnode p = (qnode) pthread_getspecific(pthread_key);
-        p.succ_must_wait.store(true);
-        qnode* pred = tail.exchange(&p); // W||
-        while (pred->succ_must_wait.load()) {
-            std::cout<<1<<std::endl;
-        }
-        head.store(&p);
-        qnode* pp = &p;
-//        pp = pred; fixme
-        qnode** ppp = &pp;
-        (*ppp) = pred;
+        auto * thread_qnode_ptrs = (std::atomic<qnode*>*) pthread_getspecific(pthread_key);
+        int* t_id = (int*) pthread_getspecific(pthread_id_key);
+        std::atomic<qnode*>* p = thread_qnode_ptrs + *t_id;
+        p->load()->succ_must_wait.store(true);
+        qnode* pred = tail.exchange(p->load()); // W||
+        while (pred->succ_must_wait.load());
+        head.store(p->load());
+        p->exchange(pred);
         atomic_thread_fence(std::memory_order_acquire);
         atomic_signal_fence(std::memory_order_acquire);
     }
@@ -572,24 +571,40 @@ void test_clh(clh_lock &lock, const int t_cnt, const int iter_cnt, const int cor
 }
 
 void test_k42_clh(k42_clh_lock &lock, const int t_cnt, const int iter_cnt, const int cores, const int step) {
-    k42_clh_lock::qnode initial_thread_qnodes[t_cnt];
     struct t_state {
         k42_clh_lock *lock;
         std::atomic_bool *start;
         int *counter;
         int iter_cnt;
-        k42_clh_lock::qnode thread_qnode;
+        int t_id;
+        std::atomic<k42_clh_lock::qnode*>* thread_qnode_ptrs;
     };
     pthread_t threads[t_cnt];
     int counter = 0;
     std::atomic_bool start;
+    pthread_key_create(&pthread_key, nullptr);
+    pthread_key_create(&pthread_id_key, nullptr);
+
+    k42_clh_lock::qnode initial_thread_qnodes[t_cnt];
+    std::atomic<k42_clh_lock::qnode*> thread_qnode_ptrs[t_cnt];
     for (int i = 0; i < t_cnt; i++) {
-        t_state params = {&lock, &start, &counter, iter_cnt, initial_thread_qnodes[i]};
+        thread_qnode_ptrs[i] = &initial_thread_qnodes[i];
+    }
+
+    for (int i = 0; i < t_cnt; i++) {
+        auto * param = new t_state();
+        param->lock = &lock;
+        param->start = &start;
+        param->counter = &counter;
+        param->iter_cnt = iter_cnt;
+        param->t_id = i;
+        param->thread_qnode_ptrs = thread_qnode_ptrs;
         pthread_create(&(threads[i]), nullptr, [](void *args) -> void * {
             auto *state = static_cast<struct t_state *>(args);
             std::atomic_bool *trigger = state->start;
             int *cnt = state->counter, it_cnt = state->iter_cnt;
-            pthread_setspecific(pthread_key, &state->thread_qnode);
+            pthread_setspecific(pthread_key, state->thread_qnode_ptrs);
+            pthread_setspecific(pthread_id_key, (void*) &state->t_id);
             while (!trigger->load());
             for (int t = 0; t < it_cnt; t++) {
                 state->lock->acquire();
@@ -597,7 +612,8 @@ void test_k42_clh(k42_clh_lock &lock, const int t_cnt, const int iter_cnt, const
                 state->lock->release();
             }
             return nullptr;
-        }, &params);
+        }, param);
+//        delete param ?? fixme
         set_affinity(threads[i], i, cores, step);
     }
     start = true;
