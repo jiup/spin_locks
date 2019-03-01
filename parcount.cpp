@@ -42,8 +42,6 @@ void test_k42_clh(k42_clh_lock &lock, int t_cnt, int iter_cnt, int cores, int st
 
 pthread_key_t pthread_key;
 
-pthread_key_t pthread_id_key;
-
 class lock {
 public:
     virtual void acquire() = 0;
@@ -51,7 +49,9 @@ public:
     virtual void release() = 0;
 };
 
-// C++ mutex
+/**
+ * C++ Build-in Mutex Lock
+ */
 class cpp_mutex_lock : public lock {
 private:
     std::mutex lock;
@@ -70,7 +70,9 @@ public:
     }
 };
 
-// naive TAS lock
+/**
+ * Naive Test-And-Set Lock
+ */
 class tas_lock : public lock {
 private:
     std::atomic_flag f = ATOMIC_FLAG_INIT;
@@ -91,8 +93,10 @@ public:
     }
 };
 
-// TAS lock with well-tuned exponential backoff
-// you’ll need to experiment with different base, multiplier, and cap values
+/**
+ * Test-And-Set Lock (with well-tuned exponential backoff)
+ * todo: you’ll need to experiment with different base, multiplier, and cap values
+ */
 class eback_tas_lock : public lock {
 private:
     std::atomic_flag f = ATOMIC_FLAG_INIT;
@@ -119,7 +123,9 @@ public:
     }
 };
 
-// naive ticket lock
+/**
+ * Naive Ticket Lock
+ */
 class ticket_lock : public lock {
 private:
     std::atomic_int next_ticket{};
@@ -143,8 +149,12 @@ public:
     }
 };
 
-// ticket lock with well-tuned proportional backoff
-// tuning parameter base should be chosen to be roughly the length of a trivial critical section
+/**
+ * Ticket Lock (with well-tuned proportional backoff)
+ *
+ * @note tuning parameter base should be chosen to be
+ * roughly the length of a trivial critical section.
+ */
 class pback_ticket_lock : public lock {
 public:
     explicit pback_ticket_lock(int base = 20) : base(base) {}
@@ -175,7 +185,9 @@ private:
     const int base;
 };
 
-// MCS lock
+/**
+ * MCS Lock
+ */
 class mcs_lock {
 public:
     struct qnode {
@@ -217,7 +229,9 @@ private:
     std::atomic<qnode*> tail{};
 };
 
-// "K42" MCS lock with standard interface
+/**
+ * K42_MCS Lock (with standard interface)
+ */
 class k42_mcs_lock : public lock {
 public:
     struct qnode {
@@ -286,7 +300,9 @@ private:
     qnode q = qnode();
 };
 
-// CLH lock
+/**
+ * CLH Lock
+ */
 class clh_lock {
 public:
     struct qnode {
@@ -325,7 +341,12 @@ private:
     std::atomic<qnode*> tail{};
 };
 
-// “K42” CLH lock
+/**
+ * K42_CLH Lock (with standard interface)
+ *
+ * @note thread-local storage is required for this lock, hence
+ * a special test function @test_k42_clh was introduced.
+ */
 class k42_clh_lock : public lock {
 public:
     struct qnode {
@@ -344,9 +365,7 @@ public:
     k42_clh_lock(k42_clh_lock const &that) {}
 
     void acquire() override {
-        auto * thread_qnode_ptrs = (std::atomic<qnode*>*) pthread_getspecific(pthread_key);
-        int* t_id = (int*) pthread_getspecific(pthread_id_key);
-        std::atomic<qnode*>* p = thread_qnode_ptrs + *t_id;
+        auto* p = (std::atomic<qnode*>*) pthread_getspecific(pthread_key);
         p->load()->succ_must_wait.store(true);
         qnode* pred = tail.exchange(p->load()); // W||
         while (pred->succ_must_wait.load());
@@ -576,35 +595,25 @@ void test_k42_clh(k42_clh_lock &lock, const int t_cnt, const int iter_cnt, const
         std::atomic_bool *start;
         int *counter;
         int iter_cnt;
-        int t_id;
-        std::atomic<k42_clh_lock::qnode*>* thread_qnode_ptrs;
+        std::atomic<k42_clh_lock::qnode*> thread_qnode_ptr;
     };
+    t_state params[t_cnt];
     pthread_t threads[t_cnt];
     int counter = 0;
     std::atomic_bool start;
     pthread_key_create(&pthread_key, nullptr);
-    pthread_key_create(&pthread_id_key, nullptr);
-
     k42_clh_lock::qnode initial_thread_qnodes[t_cnt];
-    std::atomic<k42_clh_lock::qnode*> thread_qnode_ptrs[t_cnt];
     for (int i = 0; i < t_cnt; i++) {
-        thread_qnode_ptrs[i] = &initial_thread_qnodes[i];
-    }
-
-    for (int i = 0; i < t_cnt; i++) {
-        auto * param = new t_state();
-        param->lock = &lock;
-        param->start = &start;
-        param->counter = &counter;
-        param->iter_cnt = iter_cnt;
-        param->t_id = i;
-        param->thread_qnode_ptrs = thread_qnode_ptrs;
+        params[i].lock = &lock;
+        params[i].start = &start;
+        params[i].counter = &counter;
+        params[i].iter_cnt = iter_cnt;
+        params[i].thread_qnode_ptr.store(&initial_thread_qnodes[i]);
         pthread_create(&(threads[i]), nullptr, [](void *args) -> void * {
             auto *state = static_cast<struct t_state *>(args);
             std::atomic_bool *trigger = state->start;
             int *cnt = state->counter, it_cnt = state->iter_cnt;
-            pthread_setspecific(pthread_key, state->thread_qnode_ptrs);
-            pthread_setspecific(pthread_id_key, (void*) &state->t_id);
+            pthread_setspecific(pthread_key, &state->thread_qnode_ptr);
             while (!trigger->load());
             for (int t = 0; t < it_cnt; t++) {
                 state->lock->acquire();
@@ -612,8 +621,7 @@ void test_k42_clh(k42_clh_lock &lock, const int t_cnt, const int iter_cnt, const
                 state->lock->release();
             }
             return nullptr;
-        }, param);
-//        delete param ?? fixme
+        }, &params[i]);
         set_affinity(threads[i], i, cores, step);
     }
     start = true;
@@ -622,6 +630,7 @@ void test_k42_clh(k42_clh_lock &lock, const int t_cnt, const int iter_cnt, const
         pthread_join(threads[i], nullptr);
     }
     auto end_t = std::chrono::high_resolution_clock::now();
+    pthread_key_delete(pthread_key);
     std::chrono::duration<double, std::milli> diff = end_t - start_t;
     std::cout << "result of count: " << counter << std::endl;
     std::cout << "completed in " << diff.count() << " ms" << std::endl;
