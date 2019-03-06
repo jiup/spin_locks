@@ -5,7 +5,6 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
-#include <stdatomic.h>
 #include <unistd.h>
 
 class lock;
@@ -95,7 +94,6 @@ public:
 
 /**
  * Test-And-Set Lock (with well-tuned exponential backoff)
- * todo: you’ll need to experiment with different base, multiplier, and cap values
  */
 class eback_tas_lock : public lock {
 private:
@@ -103,7 +101,7 @@ private:
     const int base, limit, multiplier;
 
 public:
-    explicit eback_tas_lock(int base = 10240, int limit = 256, int multiplier = 2) : base(base), limit(limit),
+    explicit eback_tas_lock(int base = 96, int limit = 6291456, int multiplier = 6) : base(base), limit(limit),
                                                                                      multiplier(multiplier) {}
 
     eback_tas_lock(eback_tas_lock const &that) : base(that.base), limit(that.limit), multiplier(that.multiplier) {}
