@@ -7,6 +7,10 @@
 #include <chrono>
 #include <unistd.h>
 
+#define RELAXED std::memory_order_relaxed
+#define ACQ std::memory_order_acquire
+#define REL std::memory_order_release
+
 class lock;
 
 class cpp_mutex_lock;
@@ -82,18 +86,18 @@ public:
     tas_lock(tas_lock const &that) {}
 
     void acquire() override {
-        while (f.test_and_set());
-        atomic_thread_fence(std::memory_order_acquire);
-        atomic_signal_fence(std::memory_order_acquire);
+        while (f.test_and_set(RELAXED));
+        atomic_thread_fence(ACQ);
+        atomic_signal_fence(ACQ);
     }
 
     void release() override {
-        f.clear();
+        f.clear(REL);
     }
 };
 
 /**
- * Test-And-Set Lock (with well-tuned exponential backoff)
+ * Test-And-Set Lock (with exponential backoff)
  */
 class eback_tas_lock : public lock {
 private:
@@ -102,22 +106,22 @@ private:
 
 public:
     explicit eback_tas_lock(int base = 96, int limit = 6291456, int multiplier = 6) : base(base), limit(limit),
-                                                                                     multiplier(multiplier) {}
+                                                                                      multiplier(multiplier) {}
 
     eback_tas_lock(eback_tas_lock const &that) : base(that.base), limit(that.limit), multiplier(that.multiplier) {}
 
     void acquire() override {
         int delay = base;
-        while (f.test_and_set()) {
+        while (f.test_and_set(RELAXED)) {
             for (int i = 0; i < delay; i++);
             delay = std::min(delay * multiplier, limit);
         }
-        atomic_thread_fence(std::memory_order_acquire);
-        atomic_signal_fence(std::memory_order_acquire);
+        atomic_thread_fence(ACQ);
+        atomic_signal_fence(ACQ);
     }
 
     void release() override {
-        f.clear();
+        f.clear(REL);
     }
 };
 
@@ -135,20 +139,20 @@ public:
     ticket_lock(ticket_lock const &that) {}
 
     void acquire() override {
-        int my_ticket = next_ticket.fetch_add(1);
-        while (now_serving.load() != my_ticket);
-        atomic_thread_fence(std::memory_order_acquire);
-        atomic_signal_fence(std::memory_order_acquire);
+        int my_ticket = next_ticket.fetch_add(1, RELAXED);
+        while (now_serving.load(RELAXED) != my_ticket);
+        atomic_thread_fence(ACQ);
+        atomic_signal_fence(ACQ);
     }
 
     void release() override {
-        int t = now_serving.load() + 1;
-        now_serving.store(t, std::memory_order_release);
+        int t = now_serving.load(RELAXED) + 1;
+        now_serving.store(t, REL);
     }
 };
 
 /**
- * Ticket Lock (with well-tuned proportional backoff)
+ * Ticket Lock (with proportional backoff)
  *
  * @note tuning parameter base should be chosen to be
  * roughly the length of a trivial critical section.
@@ -160,21 +164,21 @@ public:
     pback_ticket_lock(pback_ticket_lock const &that) : base(that.base) {}
 
     void acquire() override {
-        int my_ticket = next_ticket.fetch_add(1), ns;
+        int my_ticket = next_ticket.fetch_add(1, RELAXED), ns;
         while (true) {
-            ns = now_serving.load();
+            ns = now_serving.load(RELAXED);
             if (ns == my_ticket) {
                 break;
             }
             for (int i = 0, pause = base * (my_ticket - ns); i < pause; i++);
         }
-        atomic_thread_fence(std::memory_order_acquire);
-        atomic_signal_fence(std::memory_order_acquire);
+        atomic_thread_fence(ACQ);
+        atomic_signal_fence(ACQ);
     }
 
     void release() override {
-        int t = now_serving.load() + 1;
-        now_serving.store(t, std::memory_order_release);
+        int t = now_serving.load(RELAXED) + 1;
+        now_serving.store(t, REL);
     }
 
 private:
@@ -190,8 +194,9 @@ class mcs_lock {
 public:
     struct qnode {
         qnode() = default;
+
         qnode(qnode const &that) {};
-        std::atomic<qnode*> next{nullptr};
+        std::atomic<qnode *> next{nullptr};
         std::atomic<bool> waiting{true};
     };
 
@@ -200,31 +205,31 @@ public:
     mcs_lock(mcs_lock const &that) {};
 
     void acquire(qnode &p) {
-        p.next.store(nullptr);
-        p.waiting.store(true, std::memory_order_relaxed);
-        qnode* prev = tail.exchange(&p, std::memory_order_release); // W||
+        p.next.store(nullptr, REL);
+        p.waiting.store(true, RELAXED);
+        qnode *prev = tail.exchange(&p, REL); // W||
         if (prev != nullptr) {
-            prev->next.store(&p, std::memory_order_relaxed);
-            while (p.waiting.load());
+            prev->next.store(&p, RELAXED);
+            while (p.waiting.load(RELAXED));
         }
-        atomic_thread_fence(std::memory_order_acquire);
-        atomic_signal_fence(std::memory_order_acquire);
+        atomic_thread_fence(ACQ);
+        atomic_signal_fence(ACQ);
     }
 
     void release(qnode &p) {
-        qnode* succ = p.next.load(std::memory_order_acquire); // WR||
+        qnode *succ = p.next.load(ACQ); // WR||
         if (succ == nullptr) {
-            qnode* t = &p;
-            if (tail.compare_exchange_strong(t, nullptr)) {
+            qnode *t = &p;
+            if (tail.compare_exchange_strong(t, nullptr, RELAXED)) {
                 return;
             }
-            while ((succ = p.next.load(std::memory_order_relaxed)) == nullptr);
+            while ((succ = p.next.load(RELAXED)) == nullptr);
         }
-        succ->waiting.store(false);
+        succ->waiting.store(false, RELAXED);
     }
 
 private:
-    std::atomic<qnode*> tail{};
+    std::atomic<qnode *> tail{};
 };
 
 /**
@@ -234,67 +239,69 @@ class k42_mcs_lock : public lock {
 public:
     struct qnode {
         qnode() = default;
-        qnode(qnode* tail, qnode* next) {
+
+        qnode(qnode *tail, qnode *next) {
             this->tail = tail;
             this->next = next;
         }
+
         qnode(qnode const &that) {};
-        std::atomic<qnode*> tail{};
-        std::atomic<qnode*> next{};
+        std::atomic<qnode *> tail{};
+        std::atomic<qnode *> next{};
     };
 
     ~k42_mcs_lock() {
-        delete(waiting);
+        delete (waiting);
     }
 
     void acquire() override {
         while (true) {
-            qnode* prev = q.tail.load();
+            qnode *prev = q.tail.load(RELAXED);
             if (prev == nullptr) {
-                qnode* _null = nullptr;
-                if (q.tail.compare_exchange_strong(_null, &q)) {
+                qnode *_null = nullptr;
+                if (q.tail.compare_exchange_strong(_null, &q, RELAXED)) {
                     break;
                 }
             } else {
                 auto n = qnode(waiting, nullptr);
-                if (q.tail.compare_exchange_strong(prev, &n)) { // W||
-                    prev->next.store(&n);
-                    while (n.tail.load() == waiting);
-                    qnode* succ = n.next.load();
+                if (q.tail.compare_exchange_strong(prev, &n, REL)) { // W||
+                    prev->next.store(&n, RELAXED);
+                    while (n.tail.load(RELAXED) == waiting);
+                    qnode *succ = n.next.load(RELAXED);
                     if (succ == nullptr) {
-                        q.next.store(nullptr);
+                        q.next.store(nullptr, REL);
                         auto tmp = &n;
-                        if (!(q.tail.compare_exchange_strong(tmp, &q))) {
-                            while ((succ = n.next.load()) == nullptr);
-                            q.next.store(succ);
+                        if (!(q.tail.compare_exchange_strong(tmp, &q, RELAXED))) {
+                            while ((succ = n.next.load(RELAXED)) == nullptr);
+                            q.next.store(succ, REL);
                         }
                         break;
                     } else {
-                        q.next.store(succ);
+                        q.next.store(succ, REL);
                         break;
                     }
                 }
             }
         }
-        atomic_thread_fence(std::memory_order_acquire);
-        atomic_signal_fence(std::memory_order_acquire);
+        atomic_thread_fence(ACQ);
+        atomic_signal_fence(ACQ);
     }
 
     void release() override {
-        qnode* succ = q.next.load(); // RW||
+        qnode *succ = q.next.load(ACQ); // RW||
         if (succ == nullptr) {
-            auto* tmp = &q;
-            qnode* _null = nullptr;
-            if (q.tail.compare_exchange_strong(tmp, _null)) {
+            auto *tmp = &q;
+            qnode *_null = nullptr;
+            if (q.tail.compare_exchange_strong(tmp, _null, RELAXED)) {
                 return;
             }
-            while ((succ = q.next.load()) == nullptr);
+            while ((succ = q.next.load(RELAXED)) == nullptr);
         }
-        succ->tail.store(nullptr);
+        succ->tail.store(nullptr, RELAXED);
     }
 
 private:
-    qnode* waiting = new qnode;
+    qnode *waiting = new qnode;
     qnode q = qnode();
 };
 
@@ -305,12 +312,14 @@ class clh_lock {
 public:
     struct qnode {
         qnode() = default;
-        qnode(qnode* prev, bool succ_must_wait) {
+
+        qnode(qnode *prev, bool succ_must_wait) {
             this->prev = prev;
             this->succ_must_wait = succ_must_wait;
         }
+
         qnode(qnode const &that) {};
-        std::atomic<qnode*> prev{nullptr};
+        std::atomic<qnode *> prev{nullptr};
         std::atomic<bool> succ_must_wait{true};
     };
 
@@ -320,23 +329,23 @@ public:
 
     clh_lock(clh_lock const &that) {}
 
-    void acquire(qnode* p) {
-        p->succ_must_wait.store(true);
-        qnode* pred = p->prev = tail.exchange(p); // W||
-        while (pred->succ_must_wait.load());
-        atomic_thread_fence(std::memory_order_acquire);
-        atomic_signal_fence(std::memory_order_acquire);
+    void acquire(qnode *p) {
+        p->succ_must_wait.store(true, RELAXED);
+        qnode *pred = p->prev = tail.exchange(p, REL); // W||
+        while (pred->succ_must_wait.load(RELAXED));
+        atomic_thread_fence(ACQ);
+        atomic_signal_fence(ACQ);
     }
 
-    void release(qnode** pp) {
-        qnode* pred = (*pp)->prev;
-        (*pp)->succ_must_wait.store(false); // RW||
+    void release(qnode **pp) {
+        qnode *pred = (*pp)->prev;
+        (*pp)->succ_must_wait.store(false, REL); // RW||
         *pp = pred;
     }
 
 private:
     qnode dummy = {nullptr, false};
-    std::atomic<qnode*> tail{};
+    std::atomic<qnode *> tail{};
 };
 
 /**
@@ -349,9 +358,11 @@ class k42_clh_lock : public lock {
 public:
     struct qnode {
         qnode() = default;
+
         explicit qnode(bool succ_must_wait) {
             this->succ_must_wait = succ_must_wait;
         }
+
         qnode(qnode const &that) {};
         std::atomic<bool> succ_must_wait{};
     };
@@ -363,24 +374,24 @@ public:
     k42_clh_lock(k42_clh_lock const &that) {}
 
     void acquire() override {
-        auto* p = (std::atomic<qnode*>*) pthread_getspecific(pthread_key);
-        p->load()->succ_must_wait.store(true);
-        qnode* pred = tail.exchange(p->load()); // W||
-        while (pred->succ_must_wait.load());
-        head.store(p->load());
-        p->exchange(pred);
-        atomic_thread_fence(std::memory_order_acquire);
-        atomic_signal_fence(std::memory_order_acquire);
+        auto *p = (std::atomic<qnode *> *) pthread_getspecific(pthread_key);
+        p->load(RELAXED)->succ_must_wait.store(true, RELAXED);
+        qnode *pred = tail.exchange(p->load(RELAXED), REL); // W||
+        while (pred->succ_must_wait.load(RELAXED));
+        head.store(p->load(RELAXED));
+        p->exchange(pred, RELAXED);
+        atomic_thread_fence(ACQ);
+        atomic_signal_fence(ACQ);
     }
 
     void release() override {
-        head.load()->succ_must_wait.store(false); // RW||
+        head.load(ACQ)->succ_must_wait.store(false, REL); // RW||
     }
 
 private:
     qnode dummy = qnode(false);
-    std::atomic<qnode*> tail{};
-    std::atomic<qnode*> head{};
+    std::atomic<qnode *> tail{};
+    std::atomic<qnode *> head{};
 };
 
 
@@ -422,7 +433,7 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-void set_affinity(pthread_t &thread, int __unused i, const int __unused cores, const int __unused step) {
+void set_affinity(pthread_t &thread, int i, const int cores, const int step) {
 #ifdef __linux__
     if (cores == 0) return;
     cpu_set_t c_set;
@@ -566,11 +577,10 @@ void test_clh(clh_lock &lock, const int t_cnt, const int iter_cnt, const int cor
             int *cnt = state->counter, it_cnt = state->iter_cnt;
             while (!trigger->load());
             for (int t = 0; t < it_cnt; t++) {
-                auto* qnode = new clh_lock::qnode();
+                auto *qnode = new clh_lock::qnode();
                 state->lock->acquire(qnode);
                 *cnt = *cnt + 1;
                 state->lock->release(&qnode);
-                // delete qnode ?? fixme
             }
             return nullptr;
         }, &params);
@@ -593,7 +603,7 @@ void test_k42_clh(k42_clh_lock &lock, const int t_cnt, const int iter_cnt, const
         std::atomic_bool *start;
         int *counter;
         int iter_cnt;
-        std::atomic<k42_clh_lock::qnode*> thread_qnode_ptr;
+        std::atomic<k42_clh_lock::qnode *> thread_qnode_ptr;
     };
     t_state params[t_cnt];
     pthread_t threads[t_cnt];
